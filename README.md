@@ -31,7 +31,7 @@ pip install PyQt5 requests beautifulsoup4 openpyxl
 ### 2. 启动程序
 
 ```bash
-python hydro_checker.py
+python hydroSC.py
 ```
 
 ### 3. 注意事项
