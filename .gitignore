@@ -1,0 +1,60 @@
+# ───────────────────────────────────────────────
+# HydroOJ Plagiarism‑Checker  ·  .gitignore
+# ───────────────────────────────────────────────
+
+########################
+#  Python / PyQt files #
+########################
+
+# compiled python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# virtual‑env / poetry
+.env/
+.venv/
+venv*/
+poetry.lock
+
+# test / coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+########################
+#  Project Artifacts   #
+########################
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# local cache & runtime data
+cache/
+answers/
+
+# cached ZIP downloads or temp files
+*.zip
+*.tmp
+*.log
+
+# saved login info (Base64 json)
+cache/cred.dat
+
+# OS meta
+.DS_Store
+Thumbs.db
+
+########################
+#  Markdown / docs     #
+########################
+*.orig
+*.tox
