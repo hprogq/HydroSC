@@ -176,7 +176,8 @@ class PlagiarismChecker:
             for i in range(n):
                 groups[find(i)].append(i)
 
-            for gid, g in enumerate(groups.values(), 1):
+            gid = 1
+            for g in groups.values():
                 if len(g) < 2:
                     continue
                 members = []
@@ -189,6 +190,7 @@ class PlagiarismChecker:
                         code=s['code'], path=s['path']
                     ))
                 result[pid][lang].append(dict(groupId=gid, members=members))
+                gid += 1
         return result
 
     def run(self):
