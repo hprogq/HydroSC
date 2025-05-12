@@ -575,37 +575,48 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         if ids:
             api = f"{self.host}/{self._prefix()}api/users"
-            payload = json.dumps({
+            payload = {
                 "args": {"auto": list(ids)},
-                "projection": ["_id", "uname", "displayName"]
-            })
+                "projection": ["_id", "uname", "displayName"],
+            }
+            headers = {"Content-Type": "application/json"}
 
-            try: # 5.x 接口
-                r = self.session.post(api, data=payload,
-                                    headers={'Content-Type': 'application/json'},
-                                    timeout=20)
-                r.raise_for_status()
+            try:
+                # 5.x 接口
+                r = self.session.post(api, json=payload, headers=headers, timeout=20)
+
+                if r.status_code != 200:
+                    raise RuntimeError(f"v2 status {r.status_code}")
+
+                data = r.json()
                 self.user_map = {
-                    str(u['_id']): (u.get('displayName') or u['uname']) + f"({u['_id']})"
-                    for u in r.json()
+                    str(u["_id"]): f"{u.get('displayName') or u['uname']}({u['_id']})"
+                    for u in data
                 }
-            except Exception: # 回退 4.x 接口
+
+            except (requests.RequestException, ValueError, RuntimeError):
                 try:
-                    # GraphQL
+                    # 旧版 4.x 接口（GraphQL）
                     api_old = f"{self.host}/{self._prefix()}api"
                     ids_str = ",".join(map(str, ids))
-                    query = f"query{{users(ids:[{ids_str}]){{_id uname displayName}}}}"
-                    payload_old = json.dumps({"query": query})
-                    r = self.session.post(api_old, data=payload_old,
-                                        headers={'Content-Type': 'application/json'},
-                                        timeout=20)
-                    r.raise_for_status()
+                    gql = f"query{{users(ids:[{ids_str}]){{_id uname displayName}}}}"
+                    r = self.session.post(
+                        api_old,
+                        json={"query": gql},
+                        headers=headers,
+                        timeout=20,
+                    )
+                    if r.status_code != 200:
+                        raise RuntimeError(f"v1 status {r.status_code}")
+
                     users = r.json().get("data", {}).get("users", [])
                     self.user_map = {
-                        str(u['_id']): (u.get('displayName') or u['uname']) + f"({u['_id']})"
+                        str(u["_id"]): f"{u.get('displayName') or u['uname']}({u['_id']})"
                         for u in users
                     }
-                except Exception:
+
+                except (requests.RequestException, ValueError, RuntimeError):
+                    # 跳过
                     self.user_map = {str(i): str(i) for i in ids}
 
         return result_json
