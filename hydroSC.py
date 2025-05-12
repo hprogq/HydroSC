@@ -491,9 +491,13 @@ class MainWindow(QtWidgets.QMainWindow):
         lv = QtWidgets.QVBoxLayout(left)
         self.btn_excel = QtWidgets.QPushButton("导入 Excel 名单")
         self.btn_excel.clicked.connect(self.import_excel)
+        self.chk_show_name = QtWidgets.QCheckBox("显示姓名")
+        self.chk_show_name.setChecked(False)
+        self.chk_show_name.stateChanged.connect(self.load_result)
         self.tree = QtWidgets.QTreeWidget(); self.tree.setHeaderLabels(["雷同结果（已保存至 cache 文件夹）"])
         self.tree.itemClicked.connect(self.tree_click)
         lv.addWidget(self.btn_excel)
+        lv.addWidget(self.chk_show_name)
         lv.addWidget(self.tree, 1)
         h.addWidget(left, 2)
 
@@ -682,7 +686,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lst_mem.clear()
         self.code_view.clear()
         for m in mems:
-            name = self.user_map.get(m['user'], m['user'])
+            if self.chk_show_name.isChecked():
+                name = self.user_map.get(m['user'], m['user'])
+            else:
+                name = m['user']
             item = QtWidgets.QListWidgetItem(name)
             item.setData(32, m)
             self.lst_mem.addItem(item)
