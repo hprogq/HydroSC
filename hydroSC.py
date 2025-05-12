@@ -579,14 +579,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 "args": {"auto": list(ids)},
                 "projection": ["_id", "uname", "displayName"]
             })
-            r = self.session.post(api, data=payload,
-                                  headers={'Content-Type': 'application/json'},
-                                  timeout=20)
-            self.user_map = {
-                str(u['_id']): (u.get('displayName') or u['uname']) +
-                               f"({u['_id']})"
-                for u in r.json()
-            }
+
+            try: # 5.x 接口
+                r = self.session.post(api, data=payload,
+                                    headers={'Content-Type': 'application/json'},
+                                    timeout=20)
+                r.raise_for_status()
+                self.user_map = {
+                    str(u['_id']): (u.get('displayName') or u['uname']) + f"({u['_id']})"
+                    for u in r.json()
+                }
+            except Exception: # 回退 4.x 接口
+                try:
+                    # GraphQL
+                    api_old = f"{self.host}/{self._prefix()}api"
+                    ids_str = ",".join(map(str, ids))
+                    query = f"query{{users(ids:[{ids_str}]){{_id uname displayName}}}}"
+                    payload_old = json.dumps({"query": query})
+                    r = self.session.post(api_old, data=payload_old,
+                                        headers={'Content-Type': 'application/json'},
+                                        timeout=20)
+                    r.raise_for_status()
+                    users = r.json().get("data", {}).get("users", [])
+                    self.user_map = {
+                        str(u['_id']): (u.get('displayName') or u['uname']) + f"({u['_id']})"
+                        for u in users
+                    }
+                except Exception:
+                    self.user_map = {str(i): str(i) for i in ids}
 
         return result_json
 
