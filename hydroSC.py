@@ -7,6 +7,7 @@ hydroSC.py  –  HydroOJ Similarity Checker
 import os, sys, re, json, zipfile, shutil, traceback, base64
 from collections import defaultdict
 from difflib import SequenceMatcher
+from functools import partial
 
 # ─── 第三方 ───────────────────────────────────
 try:
@@ -42,6 +43,19 @@ def normalize(code: str, lang: str) -> str:
     code = strip_comments(code, lang)
     code = re.sub(r'\s+', ' ', code)
     return code.lower().strip()
+
+# ────────────────────── 自定义控件 ────────────────
+class NavigableListWidget(QtWidgets.QListWidget):
+    def keyPressEvent(self, event):
+        if event.key() in (QtCore.Qt.Key_Up, QtCore.Qt.Key_Down):
+            current = self.currentRow()
+            if event.key() == QtCore.Qt.Key_Up and current > 0:
+                self.setCurrentRow(current - 1)
+            elif event.key() == QtCore.Qt.Key_Down and current < self.count() - 1:
+                self.setCurrentRow(current + 1)
+            self.itemClicked.emit(self.currentItem())
+        else:
+            super().keyPressEvent(event)
 
 # ────────────────────── 相似度阈值对话框 ────────────────
 class ThresholdDialog(QtWidgets.QDialog):
@@ -97,6 +111,13 @@ class PlagiarismChecker:
     LANG_EXT = {
         '.c': 'c', '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp',
         '.java': 'java', '.py': 'py', '.py3': 'py'
+    }
+
+    LANG_NAME = {
+        'c': 'C',
+        'cpp': 'C++',
+        'java': 'Java',
+        'py': 'Python'
     }
 
     def __init__(self, ans_dir: str, hwid: str, threshold: float):
@@ -201,6 +222,25 @@ class PlagiarismChecker:
         json.dump(data, open(fp, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
         return fp
 
+    def load_result(self):
+        self.tree.clear()
+        self.lst_mem.clear()
+        self.code_view.clear()
+
+        data = json.load(open(self.json_path, encoding='utf-8'))
+        for pid in sorted(data, key=lambda x: int(x)):
+            tpid = QtWidgets.QTreeWidgetItem(self.tree, [f"题目 {pid}"])
+            for lang in data[pid]:
+                tlang = QtWidgets.QTreeWidgetItem(tpid, [PlagiarismChecker.LANG_NAME.get(lang, lang)])
+                for g in data[pid][lang]:
+                    gn = QtWidgets.QTreeWidgetItem(
+                        tlang, [f"组 {g['groupId']} ({len(g['members'])})"])
+                    gn.setData(0, 32, g['members'])
+                tlang.setExpanded(True)
+            tpid.setExpanded(True)
+
+        self.goto(self.pg_res)
+
 # ────────────────────── 后台线程 ────────────────
 class Worker(QtCore.QThread):
     finished = QtCore.pyqtSignal(object)
@@ -227,12 +267,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.resize(1100, 700)
         ensure_dir(CACHE_DIR)
+        ensure_dir(os.path.join(CACHE_DIR, "homework"))
+        ensure_dir(os.path.join(CACHE_DIR, "contest"))
 
         # 状态
         self.session = requests.Session()
         self.user_map = {}
-        self.host = self.domain_id = self.homework_id = ""
+        self.host = self.domain_id = self.target_id = ""
         self.threshold = DEF_THRESH
+        self.mode = "homework"  # 新增：模式选择
 
         # 页面栈
         self._hist = []   # 后退栈
@@ -269,7 +312,8 @@ class MainWindow(QtWidgets.QMainWindow):
         current = self.stack.currentWidget()
         if current is widget:
             return
-        self.record(current)
+        if current is not self.pg_prog:
+            self.record(current)
         if clear_forward:
             self._fwd.clear()
         self.stack.setCurrentWidget(widget)
@@ -278,15 +322,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def go_prev(self):
         if not self._hist:
             return
-        self._fwd.append(self.stack.currentWidget())
-        self.stack.setCurrentWidget(self._hist.pop())
+        current = self.stack.currentWidget()
+        if current is self.pg_prog:
+            self.stack.setCurrentWidget(self._hist.pop())
+        else:
+            self._fwd.append(current)
+            self.stack.setCurrentWidget(self._hist.pop())
         self.update_nav()
 
     def go_next(self):
         if not self._fwd:
             return
-        self._hist.append(self.stack.currentWidget())
-        self.stack.setCurrentWidget(self._fwd.pop())
+        current = self.stack.currentWidget()
+        if current is self.pg_prog:
+            self.stack.setCurrentWidget(self._fwd.pop())
+        else:
+            self._hist.append(current)
+            self.stack.setCurrentWidget(self._fwd.pop())
         self.update_nav()
 
     def update_nav(self):
@@ -299,7 +351,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _init_pages(self):
         self.pg_login  = self._page_login();   self.stack.addWidget(self.pg_login)
         self.pg_domain = self._page_domain();  self.stack.addWidget(self.pg_domain)
-        self.pg_hw     = self._page_hw();      self.stack.addWidget(self.pg_hw)
+        self.pg_mode   = self._page_mode();    self.stack.addWidget(self.pg_mode)
+        self.pg_target = self._page_target();  self.stack.addWidget(self.pg_target)
         self.pg_prog   = self._page_prog();    self.stack.addWidget(self.pg_prog)
         self.pg_res    = self._page_res();     self.stack.addWidget(self.pg_res)
 
@@ -316,20 +369,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.in_user = QtWidgets.QLineEdit()
         self.in_pass = QtWidgets.QLineEdit(); self.in_pass.setEchoMode(2)
 
-        btn_log = QtWidgets.QPushButton("登录")
-        btn_off = QtWidgets.QPushButton("离线查重（选择导出的代码包）")
+        self.btn_log = QtWidgets.QPushButton("登录")
+        self.btn_off = QtWidgets.QPushButton("离线查重（选择导出的代码包）")
 
         f.addRow("服务器地址", self.in_host)
         f.addRow("用户名", self.in_user)
         f.addRow("密码", self.in_pass)
 
         hl = QtWidgets.QHBoxLayout()
-        hl.addWidget(btn_log)
-        hl.addWidget(btn_off)
+        hl.addWidget(self.btn_log)
+        hl.addWidget(self.btn_off)
         f.addRow(hl)
 
-        btn_log.clicked.connect(self.do_login)
-        btn_off.clicked.connect(self.choose_offline)
+        self.btn_log.clicked.connect(self.do_login)
+        self.btn_off.clicked.connect(self.choose_offline)
 
         return w
 
@@ -349,7 +402,13 @@ class MainWindow(QtWidgets.QMainWindow):
         enc = base64.b64encode(json.dumps(data).encode())
         open(CRED_FILE, 'wb').write(enc)
 
-    # 登录动作
+    def set_buttons_enabled(self, enabled: bool):
+        """设置所有按钮的启用状态"""
+        self.btn_log.setEnabled(enabled)
+        self.btn_off.setEnabled(enabled)
+        if hasattr(self, 'btn_excel'):
+            self.btn_excel.setEnabled(enabled)
+
     def do_login(self):
         self.host = self.in_host.text().strip().rstrip('/')
         u = self.in_user.text().strip()
@@ -359,22 +418,35 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.warning(self, "提示", "请填完整信息")
             return
 
-        try:
-            r = self.session.post(
-                f"{self.host}/login",
-                data=dict(uname=u, password=p, tfa="", authnChallenge=""),
-                allow_redirects=False,
-                timeout=10
-            )
-            if not self.session.cookies.get('sid'):
-                raise RuntimeError("登录失败，检查用户名/密码")
+        self.btn_log.setText("登录中...")
+        self.set_buttons_enabled(False)
 
-            QtWidgets.QMessageBox.information(self, "成功", "登录成功！")
-            self.save_cred()
-            self.load_domains()
+        def login_task():
+            try:
+                r = self.session.post(
+                    f"{self.host}/login",
+                    data=dict(uname=u, password=p, tfa="", authnChallenge=""),
+                    allow_redirects=False,
+                    timeout=10
+                )
+                if not self.session.cookies.get('sid'):
+                    raise RuntimeError("登录失败，检查用户名/密码")
+                return True
+            except Exception as e:
+                return e
 
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", str(e))
+        def login_done(result):
+            self.btn_log.setText("登录")
+            self.set_buttons_enabled(True)
+            if isinstance(result, Exception):
+                QtWidgets.QMessageBox.critical(self, "错误", str(result))
+            else:
+                self.save_cred()
+                self.load_domains()
+
+        self.worker = Worker(login_task)
+        self.worker.finished.connect(login_done)
+        self.worker.start()
 
     # ——— 域选择页 ———
     def _page_domain(self):
@@ -382,87 +454,157 @@ class MainWindow(QtWidgets.QMainWindow):
         v = QtWidgets.QVBoxLayout(w)
 
         self.lst_dom = QtWidgets.QListWidget()
-        btn_next = QtWidgets.QPushButton("下一步")
+        self.btn_domain_next = QtWidgets.QPushButton("下一步")
 
         v.addWidget(QtWidgets.QLabel("选择域"))
         v.addWidget(self.lst_dom, 1)
-        v.addWidget(btn_next)
+        v.addWidget(self.btn_domain_next)
 
-        btn_next.clicked.connect(self.sel_domain)
+        self.btn_domain_next.clicked.connect(self.sel_domain)
         return w
 
     def load_domains(self):
-        try:
-            r = self.session.get(f"{self.host}/home/domain", timeout=10)
-            soup = bs4.BeautifulSoup(r.text, "html.parser")
+        self.btn_domain_next.setText("加载中...")
+        self.btn_domain_next.setEnabled(False)
+
+        def load_domains_task():
+            try:
+                r = self.session.get(f"{self.host}/home/domain", timeout=10)
+                soup = bs4.BeautifulSoup(r.text, "html.parser")
+
+                domains = []
+                seen = {}
+                for td in soup.select('td.col--name'):
+                    attr = td.get('data-star-action')
+                    m = re.search(r'id=([\w\-]+)', attr or '')
+                    if not m:
+                        continue
+                    did = m.group(1)
+
+                    name = td.get_text(strip=True)
+                    domains.append((name, did))
+                return domains
+            except Exception as e:
+                return e
+
+        def load_domains_done(result):
+            self.btn_domain_next.setText("下一步")
+            self.btn_domain_next.setEnabled(True)
+            
+            if isinstance(result, Exception):
+                QtWidgets.QMessageBox.critical(self, "错误", str(result))
+                return
 
             self.lst_dom.clear()
-
-            seen = {}
-            for td in soup.select('td.col--name'):
-                attr = td.get('data-star-action')
-                m = re.search(r'id=([\w\-]+)', attr or '')
-                if not m:
-                    continue
-                did = m.group(1)
-
-                name = td.get_text(strip=True)
+            for name, did in result:
                 it = QtWidgets.QListWidgetItem(name)
                 it.setData(32, did)
                 self.lst_dom.addItem(it)
 
             self.goto(self.pg_domain)
 
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", str(e))
+        self.worker = Worker(load_domains_task)
+        self.worker.finished.connect(load_domains_done)
+        self.worker.start()
 
     def sel_domain(self):
         it = self.lst_dom.currentItem()
         if it:
             self.domain_id = it.data(32)
-            self.load_homeworks()
+            self.goto(self.pg_mode)
 
-    # ——— 作业选择页 ———
-    def _page_hw(self):
+    # ——— 模式选择页 ———
+    def _page_mode(self):
         w = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(w)
 
-        self.lst_hw = QtWidgets.QListWidget()
-        btn_dl = QtWidgets.QPushButton("下载并查重")
+        self.lst_mode = QtWidgets.QListWidget()
+        self.btn_mode_next = QtWidgets.QPushButton("下一步")
 
-        v.addWidget(QtWidgets.QLabel("选择作业"))
-        v.addWidget(self.lst_hw, 1)
-        v.addWidget(btn_dl)
+        v.addWidget(QtWidgets.QLabel("选择模式"))
+        v.addWidget(self.lst_mode, 1)
+        v.addWidget(self.btn_mode_next)
 
-        btn_dl.clicked.connect(self.start_check_online)
+        # 添加模式选项
+        self.lst_mode.addItem("作业查重")
+        self.lst_mode.addItem("比赛查重")
+
+        self.btn_mode_next.clicked.connect(self.sel_mode)
         return w
 
-    def load_homeworks(self):
-        try:
-            r = self.session.get(f"{self.host}/{self._prefix()}homework", timeout=10)
-            soup = bs4.BeautifulSoup(r.text, "html.parser")
+    def sel_mode(self):
+        idx = self.lst_mode.currentRow()
+        if idx == 0:
+            self.mode = "homework"
+        else:
+            self.mode = "contest"
+        self.load_targets()
 
-            self.lst_hw.clear()
-            pat = rf"^/{self._prefix()}homework/([\w\d]+)$"
+    # ——— 目标选择页 ———
+    def _page_target(self):
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(w)
 
-            for a in soup.find_all("a", href=True):
-                m = re.match(pat, a['href'])
-                if m:
-                    hid = m.group(1)
-                    if hid == "create":
-                        continue;
-                    name = a.get_text(strip=True)
-                    it = QtWidgets.QListWidgetItem(f"{name} ({hid})")
-                    it.setData(32, hid)
-                    self.lst_hw.addItem(it)
+        self.lst_target = QtWidgets.QListWidget()
+        self.btn_target_dl = QtWidgets.QPushButton("下载并查重")
 
-            if not self.lst_hw.count():
-                raise RuntimeError("当前域下无作业")
+        v.addWidget(QtWidgets.QLabel(f"选择{'作业' if self.mode == 'homework' else '比赛'}"))
+        v.addWidget(self.lst_target, 1)
+        v.addWidget(self.btn_target_dl)
 
-            self.goto(self.pg_hw)
+        self.btn_target_dl.clicked.connect(self.start_check_online)
+        return w
 
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "错误", str(e))
+    def load_targets(self):
+        self.btn_mode_next.setText("加载中...")
+        self.btn_mode_next.setEnabled(False)
+
+        def load_targets_task():
+            try:
+                r = self.session.get(f"{self.host}/{self._prefix()}{self.mode}", timeout=10)
+                soup = bs4.BeautifulSoup(r.text, "html.parser")
+
+                targets = []
+                pat = rf"^/{self._prefix()}{self.mode}/([\w\d]+)$"
+
+                for a in soup.find_all("a", href=True):
+                    if not a.has_attr("data-emoji-enabled"):
+                        continue
+                    m = re.match(pat, a['href'])
+                    if m:
+                        tid = m.group(1)
+                        if tid == "create":
+                            continue
+                        name = a.get_text(strip=True)
+                        targets.append((name, tid))
+                return targets
+            except Exception as e:
+                return e
+
+        def load_targets_done(result):
+            self.btn_mode_next.setText("下一步")
+            self.btn_mode_next.setEnabled(True)
+            
+            if isinstance(result, Exception):
+                QtWidgets.QMessageBox.critical(self, "错误", str(result))
+                return
+
+            self.lst_target.clear()
+            for name, tid in result:
+                it = QtWidgets.QListWidgetItem(f"{name} ({tid})")
+                it.setData(32, tid)
+                self.lst_target.addItem(it)
+
+            if not self.lst_target.count():
+                QtWidgets.QMessageBox.warning(self, "提示", 
+                    f"当前域下无{'作业' if self.mode == 'homework' else '比赛'}")
+                return
+
+            self.goto(self.pg_target)
+
+        self.worker = Worker(load_targets_task)
+        self.worker.finished.connect(load_targets_done)
+        self.worker.start()
 
     # ——— 进度页 ———
     def _page_prog(self):
@@ -493,7 +635,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_excel.clicked.connect(self.import_excel)
         self.chk_show_name = QtWidgets.QCheckBox("显示姓名")
         self.chk_show_name.setChecked(False)
-        self.chk_show_name.stateChanged.connect(self.load_result)
+        self.chk_show_name.stateChanged.connect(self.refresh_names)
         self.tree = QtWidgets.QTreeWidget(); self.tree.setHeaderLabels(["雷同结果（已保存至 cache 文件夹）"])
         self.tree.itemClicked.connect(self.tree_click)
         lv.addWidget(self.btn_excel)
@@ -503,13 +645,48 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 右栏：Splitter(成员列表 + 源码)
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        self.lst_mem = QtWidgets.QListWidget(); self.lst_mem.itemClicked.connect(self.mem_click)
+        self.lst_mem = NavigableListWidget(); self.lst_mem.itemClicked.connect(self.mem_click)
         self.code_view = QtWidgets.QPlainTextEdit(); self.code_view.setReadOnly(True)
         self.splitter.addWidget(self.lst_mem)
         self.splitter.addWidget(self.code_view)
         self.splitter.setStretchFactor(1, 5)
         h.addWidget(self.splitter, 5)
         return w
+
+    def refresh_names(self):
+        """刷新成员列表中的名字显示"""
+        if not hasattr(self, 'current_members'):
+            return
+        current_row = self.lst_mem.currentRow()
+        self.lst_mem.clear()
+        for m in self.current_members:
+            if self.chk_show_name.isChecked():
+                name = self.user_map.get(m['user'], m['user'])
+            else:
+                name = m['user']
+            item = QtWidgets.QListWidgetItem(name)
+            item.setData(32, m)
+            self.lst_mem.addItem(item)
+        if current_row >= 0 and current_row < self.lst_mem.count():
+            self.lst_mem.setCurrentRow(current_row)
+            self.mem_click(self.lst_mem.item(current_row))
+
+    def show_group(self, mems):
+        self.lst_mem.clear()
+        self.code_view.clear()
+        self.current_members = mems  # 保存当前组成员
+        for m in mems:
+            if self.chk_show_name.isChecked():
+                name = self.user_map.get(m['user'], m['user'])
+            else:
+                name = m['user']
+            item = QtWidgets.QListWidgetItem(name)
+            item.setData(32, m)
+            self.lst_mem.addItem(item)
+
+        if self.lst_mem.count():
+            self.lst_mem.setCurrentRow(0)
+            self.mem_click(self.lst_mem.item(0))
 
     # 导入 Excel 名单
     def import_excel(self):
@@ -520,10 +697,11 @@ class MainWindow(QtWidgets.QMainWindow):
             wb = openpyxl.load_workbook(fn)
             ws = wb.active
             self.user_map.update({
-                str(r[0].value): f"{r[1].value}({r[0].value})"
+                str(r[0].value).lstrip('Uu').lstrip('0'): f"{r[1].value}({r[0].value})"
                 for r in ws.iter_rows(min_row=2) if r[0].value
             })
             self.load_result()
+            self.refresh_names()  # 自动刷新当前列表
             QtWidgets.QMessageBox.information(self, "OK", "名单已导入并刷新")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "错误", str(e))
@@ -538,26 +716,48 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ——— 在线查重流程 ———
     def start_check_online(self):
-        item = self.lst_hw.currentItem()
+        item = self.lst_target.currentItem()
         if not item:
             return
         if not self.ask_threshold():
             return
 
-        self.homework_id = item.data(32)
-        self.show_prog("下载作业代码…")
+        self.target_id = item.data(32)
+        mode_dir = os.path.join(CACHE_DIR, self.mode)
+        zip_path = os.path.join(mode_dir, f"{self.target_id}.zip")
+        result_json = os.path.join(mode_dir, f"result-{self.target_id}.json")
+
+        # 检查缓存
+        if os.path.isfile(zip_path) or os.path.isfile(result_json):
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "提示",
+                "发现上一次的缓存，是否清除？",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No
+            )
+            if reply == QtWidgets.QMessageBox.Yes:
+                if os.path.isfile(zip_path):
+                    os.remove(zip_path)
+                if os.path.isfile(result_json):
+                    os.remove(result_json)
+
+        self.btn_target_dl.setText("处理中...")
+        self.btn_target_dl.setEnabled(False)
+        self.show_prog(f"下载{'作业' if self.mode == 'homework' else '比赛'}代码…")
 
         self.worker = Worker(self._job_online)
         self.worker.finished.connect(self.job_done)
         self.worker.start()
 
     def _job_online(self):
-        ensure_dir(CACHE_DIR)
-        zip_path = os.path.join(CACHE_DIR, f"{self.homework_id}.zip")
+        mode_dir = os.path.join(CACHE_DIR, self.mode)
+        ensure_dir(mode_dir)
+        zip_path = os.path.join(mode_dir, f"{self.target_id}.zip")
 
         # 下载 ZIP（若本地不存在）
         if not os.path.isfile(zip_path):
-            url = f"{self.host}/{self._prefix()}homework/{self.homework_id}/code"
+            url = f"{self.host}/{self._prefix()}{self.mode}/{self.target_id}/code"
             with self.session.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
                 open(zip_path, 'wb').write(r.content)
@@ -568,7 +768,7 @@ class MainWindow(QtWidgets.QMainWindow):
         zipfile.ZipFile(zip_path).extractall(ANS_DIR)
 
         # 查重
-        result_json = PlagiarismChecker(ANS_DIR, self.homework_id,
+        result_json = PlagiarismChecker(ANS_DIR, self.target_id,
                                         self.threshold).run()
 
         # 获取用户名
@@ -633,7 +833,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.ask_threshold():
             return
 
-        self.homework_id = os.path.splitext(os.path.basename(zp))[0]
+        self.target_id = os.path.splitext(os.path.basename(zp))[0]
         self.show_prog("离线查重…")
 
         self.worker = Worker(self._job_offline, zp)
@@ -644,16 +844,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if os.path.isdir(ANS_DIR):
             shutil.rmtree(ANS_DIR)
         zipfile.ZipFile(zip_path).extractall(ANS_DIR)
-        return PlagiarismChecker(ANS_DIR, self.homework_id,
+        return PlagiarismChecker(ANS_DIR, self.target_id,
                                  self.threshold).run()
 
     # ——— 任务结束统一回调 ———
     def job_done(self, res):
+        self.btn_target_dl.setText("下载并查重")
+        self.btn_target_dl.setEnabled(True)
         if isinstance(res, Exception):
             QtWidgets.QMessageBox.critical(self, "错误", str(res))
             self.goto(self.pg_login)
             return
         self.json_path = res
+        self.chk_show_name.setChecked(False)  # 确保不显示姓名
         self.load_result()
 
     # ——— 结果树渲染 ———
@@ -666,7 +869,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for pid in sorted(data, key=lambda x: int(x)):
             tpid = QtWidgets.QTreeWidgetItem(self.tree, [f"题目 {pid}"])
             for lang in data[pid]:
-                tlang = QtWidgets.QTreeWidgetItem(tpid, [lang])
+                tlang = QtWidgets.QTreeWidgetItem(tpid, [PlagiarismChecker.LANG_NAME.get(lang, lang)])
                 for g in data[pid][lang]:
                     gn = QtWidgets.QTreeWidgetItem(
                         tlang, [f"组 {g['groupId']} ({len(g['members'])})"])
@@ -681,22 +884,6 @@ class MainWindow(QtWidgets.QMainWindow):
         mems = it.data(0, 32)
         if mems:
             self.show_group(mems)
-
-    def show_group(self, mems):
-        self.lst_mem.clear()
-        self.code_view.clear()
-        for m in mems:
-            if self.chk_show_name.isChecked():
-                name = self.user_map.get(m['user'], m['user'])
-            else:
-                name = m['user']
-            item = QtWidgets.QListWidgetItem(name)
-            item.setData(32, m)
-            self.lst_mem.addItem(item)
-
-        if self.lst_mem.count():
-            self.lst_mem.setCurrentRow(0)
-            self.mem_click(self.lst_mem.item(0))
 
     def mem_click(self, item):
         mem = item.data(32)
