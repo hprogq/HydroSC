@@ -120,6 +120,15 @@ class PlagiarismChecker:
         'py': 'Python'
     }
 
+    # 新增：评测结果编号与字符串映射
+    RESULT_MAP = {
+        0: 'WAITING', 1: 'ACCEPTED', 2: 'WRONG_ANSWER', 3: 'TIME_LIMIT_EXCEEDED',
+        4: 'MEMORY_LIMIT_EXCEEDED', 5: 'OUTPUT_LIMIT_EXCEEDED', 6: 'RUNTIME_ERROR',
+        7: 'COMPILE_ERROR', 8: 'SYSTEM_ERROR', 9: 'CANCELED', 10: 'ETC', 11: 'HACKED',
+        20: 'JUDGING', 21: 'COMPILING', 22: 'FETCHED', 30: 'IGNORED', 31: 'FORMAT_ERROR',
+        32: 'HACK_SUCCESSFUL', 33: 'HACK_UNSUCCESSFUL'
+    }
+
     def __init__(self, ans_dir: str, hwid: str, threshold: float):
         self.dir = ans_dir
         self.hwid = hwid
@@ -141,6 +150,14 @@ class PlagiarismChecker:
                 if not lang:
                     continue
 
+                # 新增：解析评测结果和得分
+                result_code = None
+                score = None
+                m2 = re.search(r'_S(\d+)@(\d+(?:\.\d+)?)(?=\.)', fn)
+                if m2:
+                    result_code = int(m2.group(1))
+                    score = m2.group(2)
+
                 path = os.path.join(root, fn)
                 try:
                     code = open(path, 'r', encoding='utf-8', errors='ignore').read()
@@ -149,7 +166,8 @@ class PlagiarismChecker:
 
                 self.subs.append(
                     dict(user=uid, pid=pid, sub=rec, lang=lang,
-                         code=code, norm=normalize(code, lang), path=path)
+                         code=code, norm=normalize(code, lang), path=path,
+                         result_code=result_code, score=score)
                 )
 
         if not self.subs:
@@ -207,8 +225,11 @@ class PlagiarismChecker:
                     s = self.subs[idxs[i]]
                     members.append(dict(
                         user=s['user'], sub=s['sub'],
+                        pid=s['pid'],
                         similarity=round(best, 3),
-                        code=s['code'], path=s['path']
+                        code=s['code'], path=s['path'],
+                        result_code=s.get('result_code'),
+                        score=s.get('score')
                     ))
                 result[pid][lang].append(dict(groupId=gid, members=members))
                 gid += 1
@@ -276,6 +297,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.host = self.domain_id = self.target_id = ""
         self.threshold = DEF_THRESH
         self.mode = "homework"  # 新增：模式选择
+        self.cancelled_subs = set()  # 新增：记录已取消成绩的sub
 
         # 页面栈
         self._hist = []   # 后退栈
@@ -633,12 +655,18 @@ class MainWindow(QtWidgets.QMainWindow):
         lv = QtWidgets.QVBoxLayout(left)
         self.btn_excel = QtWidgets.QPushButton("导入 Excel 名单")
         self.btn_excel.clicked.connect(self.import_excel)
+        self.btn_home = QtWidgets.QPushButton("比赛首页")
+        self.btn_all = QtWidgets.QPushButton("全部提交")
+        self.btn_home.clicked.connect(self.open_contest_home)
+        self.btn_all.clicked.connect(self.open_all_submissions)
         self.chk_show_name = QtWidgets.QCheckBox("显示姓名")
         self.chk_show_name.setChecked(False)
         self.chk_show_name.stateChanged.connect(self.refresh_names)
         self.tree = QtWidgets.QTreeWidget(); self.tree.setHeaderLabels(["雷同结果（已保存至 cache 文件夹）"])
         self.tree.itemClicked.connect(self.tree_click)
         lv.addWidget(self.btn_excel)
+        lv.addWidget(self.btn_home)
+        lv.addWidget(self.btn_all)
         lv.addWidget(self.chk_show_name)
         lv.addWidget(self.tree, 1)
         h.addWidget(left, 2)
@@ -664,6 +692,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 name = self.user_map.get(m['user'], m['user'])
             else:
                 name = m['user']
+            # 新增：显示评测结果和得分
+            if m.get('sub') in self.cancelled_subs:
+                name += " (MANUALLY_CANCELED 0)"
+            else:
+                rc = m.get('result_code')
+                score = m.get('score')
+                if rc is not None and score is not None:
+                    rc_str = PlagiarismChecker.RESULT_MAP.get(rc, str(rc))
+                    name += f" ({rc_str} {score})"
             item = QtWidgets.QListWidgetItem(name)
             item.setData(32, m)
             self.lst_mem.addItem(item)
@@ -672,21 +709,128 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mem_click(self.lst_mem.item(current_row))
 
     def show_group(self, mems):
-        self.lst_mem.clear()
+        # 修复：移除旧的操作按钮区，只保留一排
+        if hasattr(self, 'op_btn_widget') and self.op_btn_widget:
+            idx = self.splitter.indexOf(self.op_btn_widget)
+            if idx != -1:
+                w = self.splitter.widget(idx)
+                self.splitter.widget(idx).setParent(None)
+                w.deleteLater()
+            self.op_btn_widget = None
+        # 新建操作按钮区
+        self.op_btn_widget = QtWidgets.QWidget()
+        op_layout = QtWidgets.QHBoxLayout(self.op_btn_widget)
+        self.btn_view_problem = QtWidgets.QPushButton("此题记录")
+        self.btn_view = QtWidgets.QPushButton("查看此提交")
+        self.btn_cancel = QtWidgets.QPushButton("取消成绩")
+        self.btn_rejudge = QtWidgets.QPushButton("重测")
+        self.btn_view_problem.clicked.connect(self.view_problem_records)
+        self.btn_view.clicked.connect(self.view_submission)
+        self.btn_cancel.clicked.connect(self.cancel_submission)
+        self.btn_rejudge.clicked.connect(self.rejudge_submission)
+        op_layout.addWidget(self.btn_view_problem)
+        op_layout.addWidget(self.btn_view)
+        op_layout.addWidget(self.btn_cancel)
+        op_layout.addWidget(self.btn_rejudge)
+        op_layout.addStretch(1)
+        self.splitter.insertWidget(0, self.op_btn_widget)
+
         self.code_view.clear()
         self.current_members = mems  # 保存当前组成员
-        for m in mems:
-            if self.chk_show_name.isChecked():
-                name = self.user_map.get(m['user'], m['user'])
-            else:
-                name = m['user']
-            item = QtWidgets.QListWidgetItem(name)
-            item.setData(32, m)
-            self.lst_mem.addItem(item)
-
+        self.refresh_names()
         if self.lst_mem.count():
             self.lst_mem.setCurrentRow(0)
             self.mem_click(self.lst_mem.item(0))
+        else:
+            self.btn_view.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            self.btn_rejudge.setEnabled(False)
+            self.btn_view_problem.setEnabled(False)
+
+    def mem_click(self, item):
+        mem = item.data(32)
+        if mem:
+            self.code_view.setPlainText(mem['code'])
+            self.code_view.moveCursor(QtGui.QTextCursor.Start)
+            # 启用操作按钮
+            if hasattr(self, 'btn_view'):
+                self.btn_view.setEnabled(True)
+                self.btn_cancel.setEnabled(True)
+                self.btn_rejudge.setEnabled(True)
+                self.btn_view_problem.setEnabled(True)
+        else:
+            if hasattr(self, 'btn_view'):
+                self.btn_view.setEnabled(False)
+                self.btn_cancel.setEnabled(False)
+                self.btn_rejudge.setEnabled(False)
+                self.btn_view_problem.setEnabled(False)
+
+    # 新增：查看此题记录
+    def view_problem_records(self):
+        item = self.lst_mem.currentItem()
+        if not item:
+            return
+        mem = item.data(32)
+        if not mem or not self.host or not self.target_id:
+            QtWidgets.QMessageBox.warning(self, "提示", "未检测到题目ID、比赛ID或服务器地址")
+            return
+        url = f"{self.host}/record?tid={self.target_id}&pid={mem['pid']}"
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    # 新增：操作按钮功能
+    def view_submission(self):
+        item = self.lst_mem.currentItem()
+        if not item:
+            return
+        mem = item.data(32)
+        if not mem or not self.host:
+            QtWidgets.QMessageBox.warning(self, "提示", "未检测到提交ID或服务器地址")
+            return
+        url = f"{self.host}/record/{mem['sub']}"
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def cancel_submission(self):
+        if self._post_operation_to_submission('cancel', "取消成绩"):
+            # 操作成功，给当前成员加标记
+            idx = self.lst_mem.currentRow()
+            item = self.lst_mem.item(idx)
+            mem = item.data(32) if item else None
+            if mem:
+                self.cancelled_subs.add(mem['sub'])
+                # 刷新显示
+                self.refresh_names()
+
+    def rejudge_submission(self):
+        if self._post_operation_to_submission('rejudge', "重测"):
+            # 操作成功，去掉当前成员的已取消标记
+            idx = self.lst_mem.currentRow()
+            item = self.lst_mem.item(idx)
+            mem = item.data(32) if item else None
+            if mem and mem['sub'] in self.cancelled_subs:
+                self.cancelled_subs.remove(mem['sub'])
+                # 刷新显示
+                self.refresh_names()
+
+    def _post_operation_to_submission(self, op, op_name):
+        item = self.lst_mem.currentItem()
+        if not item:
+            return False
+        mem = item.data(32)
+        if not mem or not self.host:
+            QtWidgets.QMessageBox.warning(self, "提示", "未检测到提交ID或服务器地址")
+            return False
+        url = f"{self.host}/record/{mem['sub']}"
+        try:
+            r = self.session.post(url, data={"operation": op}, allow_redirects=False)
+            if r.status_code == 302:
+                QtWidgets.QMessageBox.information(self, "成功", f"{op_name}操作成功！")
+                return True
+            else:
+                QtWidgets.QMessageBox.warning(self, "失败", f"{op_name}操作失败，返回码：{r.status_code}")
+                return False
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "错误", str(e))
+            return False
 
     # 导入 Excel 名单
     def import_excel(self):
@@ -890,6 +1034,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if mem:
             self.code_view.setPlainText(mem['code'])
             self.code_view.moveCursor(QtGui.QTextCursor.Start)
+
+    # 新增：比赛首页、全部提交按钮功能
+    def open_contest_home(self):
+        if not self.target_id or not self.host:
+            QtWidgets.QMessageBox.warning(self, "提示", "未检测到比赛ID或服务器地址")
+            return
+        url = f"{self.host}/contest/{self.target_id}"
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
+
+    def open_all_submissions(self):
+        if not self.target_id or not self.host:
+            QtWidgets.QMessageBox.warning(self, "提示", "未检测到比赛ID或服务器地址")
+            return
+        url = f"{self.host}/record?tid={self.target_id}"
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl(url))
 
 # ────────────────────── 入口 ───────────────────
 def main():
